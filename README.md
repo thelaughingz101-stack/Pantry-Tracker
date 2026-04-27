@@ -24,4 +24,16 @@ React 18, Tailwind CSS, lucide icons, Tesseract.js for OCR. Everything loads fro
 
 ## Credits
 
-Built with [Claude](https://claude.ai) (Anthropic). Uses [React](https://react.dev/), [Tailwind CSS](https://tailwindcss.com/), [lucide-react](https://lucide.dev/), [Tesseract.js](https://tesseract.projectnaptha.com/), [Babel Standalone](https://babeljs.io/docs/babel-standalone), and [esm.sh](https://esm.sh/). Font is [Noto Sans](https://fonts.google.com/noto/specimen/Noto+Sans). Background photo from [Unsplash](https://unsplash.com/). Hosted on [GitHub Pages](https://pages.github.com/).
+This project was developed with the assistance of [Claude](https://claude.ai) by Anthropic.
+
+### Technologies and Services
+
+- [React](https://react.dev/) — Frontend user interface framework  
+- [Tailwind CSS](https://tailwindcss.com/) — Styling and layout system  
+- [lucide-react](https://lucide.dev/) — Icon set  
+- [Tesseract.js](https://tesseract.projectnaptha.com/) — On-device optical character recognition  
+- [Babel Standalone](https://babeljs.io/docs/babel-standalone) — In-browser JSX compilation  
+- [esm.sh](https://esm.sh/) — ES module delivery  
+- [Noto Sans](https://fonts.google.com/noto/specimen/Noto+Sans) — Typography  
+- [Unsplash](https://unsplash.com/) — Background imagery  
+- [GitHub Pages](https://pages.github.com/) — Deployment and hosting  
