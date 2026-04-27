@@ -10,7 +10,7 @@ I built it because I kept buying duplicates of things I already had and forgetti
 - **Price history** — every price update logs the previous one with a date, and item rows show an arrow when the price has changed since last time.
 - **Recipes** — add a recipe with structured ingredients, and the app tells you what fraction of the ingredients you currently have. When you have everything, a "Cook" button appears that auto-deducts the amounts from your stock.
 - **Shopping list** — automatically aggregates low-stock items and missing recipe ingredients, with one-tap copy to clipboard.
-- **Receipt scanning** — takes a photo of a receipt and pulls out the line items using on-device OCR. No cloud, no API keys.
+- **Receipt scanning** **(WIP)** — takes a photo of a receipt and pulls out the line items using on-device OCR. No cloud, no API keys.
 
 ## How to run it
 
