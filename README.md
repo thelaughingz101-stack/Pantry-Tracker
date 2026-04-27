@@ -14,7 +14,7 @@ I built it because I kept buying duplicates of things I already had and forgetti
 
 ## How to run it
 
-Open `pantry.html` in any modern browser. That's it. No install, no build step.
+Open `index.html` in any modern browser. That's it. No install, no build step.
 
 For phone use, host it somewhere (I used GitHub Pages) and add it to your home screen from Safari.
 
