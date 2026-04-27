@@ -35,5 +35,5 @@ This project was developed with the assistance of [Claude](https://claude.ai) by
 - [Babel Standalone](https://babeljs.io/docs/babel-standalone) — In-browser JSX compilation  
 - [esm.sh](https://esm.sh/) — ES module delivery  
 - [Noto Sans](https://fonts.google.com/noto/specimen/Noto+Sans) — Typography  
-- [Unsplash](https://unsplash.com/) — Background imagery  
+- [Unsplash](https://unsplash.com/) — Background imagery [Photo by Bri RTP on Unsplash](https://unsplash.com/photos/white-ceramic-sink-with-stainless-steel-faucet-Kukdz3VKzNc?utm_source=unsplash&utm_medium=referral&utm_content=creditShareLink)
 - [GitHub Pages](https://pages.github.com/) — Deployment and hosting  
