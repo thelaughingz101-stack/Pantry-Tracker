@@ -31,14 +31,10 @@
       background: #c8d4b8;
       min-height: 100vh;
       min-height: 100dvh;
-      /* prevent rubber-band scroll from revealing white */
       background-attachment: fixed;
     }
-    /* iOS standalone (web app mode) — fill the entire screen including notch/home bar areas */
     @supports (padding: max(0px)) {
-      body {
-        padding: 0;
-      }
+      body { padding: 0; }
     }
     #boot {
       position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -63,7 +59,7 @@ import {
   AlertTriangle, Tag, ArrowUp, ArrowDown, ShoppingCart, Check, Flame,
   ChefHat, Copy, Link2, Store, Pencil, History, ImagePlus, RotateCw, Clipboard,
   SlidersHorizontal, Package, Zap,
-  ScanLine, Dice5, Salad, GlassWater, MoreHorizontal, Download, Upload,
+  Dice5, Salad, GlassWater, MoreHorizontal, Download, Upload, Search,
   Droplet, Egg, Milk, Beef, Carrot, Apple, Wheat, Cookie
 } from "lucide-react";
 
@@ -149,6 +145,104 @@ async function importAllData(payload) {
     await storage.set(BLUR_KEY, String(payload.settings.blur));
   }
 }
+
+// Append AI-generated items + recipes to existing data without overwriting
+async function mergeAddItemsAndRecipes(payload) {
+  const cur = await loadItems();
+  const curR = await loadRecipes();
+  const newItems = (payload.items || []).map(it => normalizeItem({ ...it, id: it.id || uid() }));
+  const newRecipes = (payload.recipes || []).map(r => normalizeRecipe({ ...r, id: r.id || uid() }));
+  await storage.set(ITEMS_KEY, JSON.stringify([...cur, ...newItems]));
+  await storage.set(RECIPES_KEY, JSON.stringify([...curR, ...newRecipes]));
+}
+
+// Build the prompt to give to an AI to produce importable JSON
+function buildAIPrompt(scope) {
+  const valid_groups = '"protein" | "dairy" | "meat" | "veg" | "fruit" | "grain" | "drinks" | "snack" | "other"';
+  const valid_units = '"ea" | "g" | "kg" | "ml" | "l" | "oz" | "lb" | "cup" | "tbsp" | "tsp"';
+  const valid_meals = '"breakfast" | "lunch" | "dinner" | "snack"';
+
+  const item_schema = `Item shape:
+{
+  "name": string,                    // e.g. "Chicken breast"
+  "quantity": number,                // e.g. 380
+  "unit": ${valid_units},
+  "location": "fridge" | "pantry" | "freezer",
+  "foodGroup": ${valid_groups},
+  "calories": number | "",           // optional, kcal
+  "caloriesPer": "100g" | "ea" | "serving",   // basis for the calories number
+  "price": number | null,            // optional, dollars
+  "store": string,                   // optional
+  "lowStockThreshold": number        // when to flag, e.g. 1
+}`;
+
+  const recipe_schema = `Recipe shape:
+{
+  "name": string,                    // e.g. "Garlic chicken stir fry"
+  "mealType": ${valid_meals},
+  "prepTime": number,                // minutes
+  "cookTime": number,                // minutes
+  "link": string,                    // optional URL to the recipe
+  "youtubeUrl": string,              // optional YouTube URL — any format works
+  "coverSource": "image" | "youtube",
+  "ingredients": [
+    { "name": string, "amount": number | "", "unit": ${valid_units} }
+  ]
+}`;
+
+  let scopeIntro;
+  let outputShape;
+  if (scope === "items") {
+    scopeIntro = `I'll describe what foods I have. Convert them to a list of items I can import into my pantry tracker.`;
+    outputShape = `{ "items": [ ...Item objects... ] }`;
+  } else if (scope === "recipes") {
+    scopeIntro = `I'll describe meals I want to make. Convert them to recipes I can import.`;
+    outputShape = `{ "recipes": [ ...Recipe objects... ] }`;
+  } else if (scope === "both") {
+    scopeIntro = `I'll describe both groceries I have and meals I want to make.`;
+    outputShape = `{ "items": [ ...Item objects... ], "recipes": [ ...Recipe objects... ] }`;
+  } else {
+    // ask
+    scopeIntro = `I'm going to describe groceries, meals, or both. Ask me which one I want first if it's unclear, then convert what I tell you into the format below.`;
+    outputShape = `{ "items": [ ...Item objects... ], "recipes": [ ...Recipe objects... ] }
+(Omit either array if I'm only providing one category.)`;
+  }
+
+  return `You are helping me populate a pantry tracker app. ${scopeIntro}
+
+OUTPUT RULES:
+- Reply with ONLY a single JSON object. No prose, no markdown fences, no commentary.
+- Wrap the entire response in a single { } object.
+- Use the exact field names and value types below. Strings must be in quotes. Numbers must be unquoted.
+- If a field is optional and you don't have a value, omit the field entirely (don't write "null" or "").
+- If you're unsure about a food group, pick the closest one or use "other".
+- For ingredients in recipes, prefer realistic amounts in standard units.
+
+OUTPUT SHAPE:
+${outputShape}
+
+${scope !== "recipes" ? item_schema : ""}
+${scope !== "items" ? recipe_schema : ""}
+
+Now, here is what I have:
+[describe groceries / meals here]`;
+}
+
+// Parse AI output — handle pasted JSON with potential markdown fences or extra text
+function parseAIOutput(text) {
+  let cleaned = text.trim();
+  // strip ```json fences if the AI wrapped them
+  cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "");
+  // try to find the outermost { ... } if there's prose around it
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    cleaned = cleaned.slice(start, end + 1);
+  }
+  const data = JSON.parse(cleaned);
+  if (typeof data !== "object" || data === null) throw new Error("Output is not a JSON object.");
+  return data;
+}
 function migrateFoodGroup(id) {
   if (id === "milk") return "dairy";
   if (id === "fats") return "other";
@@ -165,8 +259,8 @@ function normalizeItem(it) {
     unit: it.unit ?? "ea",
     location: it.location || "fridge",
     foodGroup: migrateFoodGroup(it.foodGroup),
-    calories: it.calories ?? "",          // number per `caloriesPer` unit
-    caloriesPer: it.caloriesPer || "100g", // "100g" | "ea" | "serving"
+    calories: it.calories ?? "",
+    caloriesPer: it.caloriesPer || "100g",
     price: it.price ?? null,
     store: it.store || "",
     onSale: !!it.onSale,
@@ -179,6 +273,8 @@ function normalizeRecipe(r) {
     id: r.id,
     name: r.name || "",
     imageUrl: r.imageUrl || "",
+    youtubeUrl: r.youtubeUrl || "",
+    coverSource: r.coverSource || (r.imageUrl ? "image" : (r.youtubeUrl ? "youtube" : "image")),
     mealType: r.mealType || "lunch",
     prepTime: r.prepTime || 0,
     cookTime: r.cookTime || 0,
@@ -300,6 +396,33 @@ function caloriesCoverage(items) {
 
 const formatKcal = (n) => n >= 10000 ? `${(n/1000).toFixed(1)}k` : n.toLocaleString();
 
+// Extract a YouTube video ID from any common URL format.
+// Supports: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID,
+// youtube.com/embed/ID, m.youtube.com variants, and bare IDs (11-char).
+function youtubeId(url) {
+  if (!url) return "";
+  const s = url.trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  const patterns = [
+    /(?:youtube\.com\/watch\?(?:.*&)?v=)([A-Za-z0-9_-]{11})/,
+    /(?:youtu\.be\/)([A-Za-z0-9_-]{11})/,
+    /(?:youtube\.com\/shorts\/)([A-Za-z0-9_-]{11})/,
+    /(?:youtube\.com\/embed\/)([A-Za-z0-9_-]{11})/,
+    /(?:youtube\.com\/v\/)([A-Za-z0-9_-]{11})/,
+  ];
+  for (const r of patterns) {
+    const m = s.match(r);
+    if (m) return m[1];
+  }
+  return "";
+}
+
+const youtubeThumb = (id) => id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : "";
+const youtubeWatchUrl = (id) => id ? `https://www.youtube.com/watch?v=${id}` : "";
+
+// Days until an item expires. Negative = already expired. null if no date set.
+// Returns null if no date or 7+ days away. Otherwise color level.
+// human-readable: "in 3 days", "expired 2 days ago", "today"
 // match an ingredient name to a stock item (case-insensitive substring both ways)
 function findStockMatch(ingName, items) {
   const n = (ingName || "").trim().toLowerCase();
@@ -337,9 +460,10 @@ function App() {
   const [recipeModal, setRecipeModal] = useState(null);
   const [cookModal, setCookModal] = useState(null);
   const [shoppingOpen, setShoppingOpen] = useState(false);
-  const [scanOpen, setScanOpen] = useState(false);
   const [suggesterOpen, setSuggesterOpen] = useState(false);
   const [dataOpen, setDataOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
   const [recipeOrder, setRecipeOrder] = useState(0);
   const [customBg, setCustomBg] = useState(null);
   const [blur, setBlur] = useState(19);
@@ -396,9 +520,16 @@ function App() {
     storage.set(BLUR_KEY, String(n)).catch(() => {});
   };
 
-  const filtered = items.filter(i =>
-    i.location === tab && (!foodFilter || i.foodGroup === foodFilter)
-  );
+  const filtered = useMemo(() => {
+    let list = items.filter(i =>
+      i.location === tab && (!foodFilter || i.foodGroup === foodFilter)
+    );
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter(i => i.name.toLowerCase().includes(q));
+    }
+    return list;
+  }, [items, tab, foodFilter, search]);
 
   const totalKcal = useMemo(() => totalCalories(items), [items]);
   const kcalCoverage = useMemo(() => caloriesCoverage(items), [items]);
@@ -548,6 +679,21 @@ function App() {
         .pop-in { animation: pop .25s cubic-bezier(.2,.8,.2,1) both; }
         @keyframes slideUp { 0% { transform: translateY(100%); } 100% { transform: translateY(0); } }
         .slide-up { animation: slideUp .28s cubic-bezier(.2,.8,.2,1) both; }
+
+        /* ============ DARK MODE ============ */
+
+        /* main heading text */
+
+        /* white card backgrounds invert */
+
+        /* dark stone-900 buttons stay dark, but lighten slightly */
+
+        /* borders */
+
+        /* inputs */
+
+        /* sheet background */
+
       `}</style>
 
       <div
@@ -569,20 +715,22 @@ function App() {
                 <h2 className="text-[22px] font-bold tracking-tight leading-none text-stone-900">What I have in</h2>
                 <div className="flex gap-1.5">
                   <button
+                    onClick={() => setSearchOpen(o => !o)}
+                    className={`h-9 w-9 rounded-full flex items-center justify-center active:scale-95 transition ${
+                      searchOpen || search ? "bg-stone-900 text-white" : "bg-white/80 text-stone-700"
+                    }`}
+                    aria-label="Search items"
+                    title="Search items"
+                  >
+                    <Search size={15} strokeWidth={2.3} />
+                  </button>
+                  <button
                     onClick={() => setSuggesterOpen(true)}
                     className="h-9 w-9 rounded-full bg-white/80 text-stone-700 flex items-center justify-center active:scale-95 transition"
                     aria-label="Suggest item"
                     title="Suggest something to eat from stock"
                   >
                     <Salad size={15} strokeWidth={2.3} />
-                  </button>
-                  <button
-                    onClick={() => setScanOpen(true)}
-                    className="h-9 w-9 rounded-full bg-white/80 text-stone-700 flex items-center justify-center active:scale-95 transition"
-                    aria-label="Scan receipt"
-                    title="Scan a receipt"
-                  >
-                    <ScanLine size={15} strokeWidth={2.3} />
                   </button>
                   <button
                     onClick={() => setShoppingOpen(true)}
@@ -605,6 +753,28 @@ function App() {
                   </button>
                 </div>
               </div>
+
+              {/* search bar — collapses when not in use */}
+              {(searchOpen || search) && (
+                <div className="mb-3">
+                  <div className="relative">
+                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+                    <input
+                      autoFocus
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder="Search items…"
+                      className="w-full bg-white/80 rounded-full pl-9 pr-9 py-2 text-[13px] outline-none border border-white/70 focus:border-stone-300 transition"
+                    />
+                    {search && (
+                      <button onClick={() => { setSearch(""); }}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 h-5 w-5 rounded-full bg-stone-200 text-stone-600 flex items-center justify-center">
+                        <X size={11} strokeWidth={3} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {/* calorie summary — total kcal stocked across the house */}
               {totalKcal > 0 && (
@@ -825,13 +995,6 @@ function App() {
           onClose={() => setShoppingOpen(false)}
         />
       )}
-      {scanOpen && (
-        <ReceiptScanModal
-          tab={tab}
-          onClose={() => setScanOpen(false)}
-          onConfirm={async (rows) => { await bulkAddItems(rows); setScanOpen(false); }}
-        />
-      )}
       {suggesterOpen && (
         <SuggesterModal
           items={items}
@@ -844,7 +1007,6 @@ function App() {
           recipeCount={recipes.length}
           onClose={() => setDataOpen(false)}
           onImported={async () => {
-            // reload from storage after import
             const [i, r] = await Promise.all([loadItems(), loadRecipes()]);
             setItems(i); setRecipes(r);
             try { const b = await storage.get(BG_KEY); if (b?.value) setCustomBg(b.value); } catch {}
@@ -877,7 +1039,7 @@ function ItemRow({ item, onClick }) {
       onClick={onClick}
       className="pill-row w-full flex items-center gap-3 pr-2 pl-1.5 py-1.5 rounded-full text-left active:scale-[0.99] transition"
     >
-      <div className="h-11 w-11 rounded-full overflow-hidden bg-stone-200/70 flex items-center justify-center shrink-0 text-stone-500">
+      <div className="h-11 w-11 rounded-full overflow-hidden bg-stone-200/70 flex items-center justify-center shrink-0 text-stone-500 relative">
         {(() => {
           if (item.imageUrl) return <img src={item.imageUrl} alt="" className="h-full w-full object-cover" />;
           const G = groupIcon(item.foodGroup);
@@ -976,17 +1138,47 @@ function RecipeCard({ recipe, items, onEdit, onCook }) {
   const pct = total ? have / total : 0;
   const canCook = total > 0 && have === total;
 
+  const ytId = youtubeId(recipe.youtubeUrl);
+  const useYoutube = recipe.coverSource === "youtube" && ytId;
+  const cover = useYoutube ? youtubeThumb(ytId) : recipe.imageUrl;
+
   const openLink = (e) => { e.stopPropagation(); if (recipe.link) window.open(recipe.link, "_blank", "noopener,noreferrer"); };
+  const openYoutube = (e) => { e.stopPropagation(); if (ytId) window.open(youtubeWatchUrl(ytId), "_blank", "noopener,noreferrer"); };
 
   return (
     <div
       onClick={() => onEdit(recipe)}
       className="snap-start shrink-0 w-[230px] h-[270px] rounded-2xl overflow-hidden relative active:scale-[0.99] transition cursor-pointer pop-in"
       style={{
-        backgroundImage: recipe.imageUrl ? `url(${recipe.imageUrl})` : "linear-gradient(135deg,#c8d4b8,#e8c9b6)",
+        backgroundImage: cover ? `url(${cover})` : "linear-gradient(135deg,#c8d4b8,#e8c9b6)",
         backgroundSize: "cover", backgroundPosition: "center",
       }}
     >
+      {/* YouTube play overlay — only on cards using a YouTube cover */}
+      {useYoutube && (
+        <button
+          onClick={openYoutube}
+          aria-label="Open YouTube video"
+          className="absolute inset-0 flex items-center justify-center group/yt"
+        >
+          <span className="h-12 w-12 rounded-full bg-black/70 flex items-center justify-center transition group-hover/yt:bg-rose-600 group-active/yt:scale-90">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="white"><polygon points="6,4 16,10 6,16" /></svg>
+          </span>
+        </button>
+      )}
+
+      {/* small YT badge if there's a video but the cover is the image */}
+      {ytId && !useYoutube && (
+        <button
+          onClick={openYoutube}
+          className="absolute top-2 left-2 h-7 px-2.5 rounded-full bg-rose-600 text-white flex items-center gap-1 active:scale-90 text-[10px] font-bold tracking-wide"
+          aria-label="Open YouTube video"
+        >
+          <svg width="11" height="11" viewBox="0 0 20 20" fill="white"><polygon points="6,4 16,10 6,16" /></svg>
+          VIDEO
+        </button>
+      )}
+
       {recipe.link && (
         <button
           onClick={openLink}
@@ -999,7 +1191,7 @@ function RecipeCard({ recipe, items, onEdit, onCook }) {
       {canCook && (
         <button
           onClick={(e) => { e.stopPropagation(); onCook(recipe); }}
-          className="absolute top-2 left-2 h-8 px-3 rounded-full bg-emerald-500 text-white flex items-center gap-1 active:scale-90 text-[11px] font-bold"
+          className={`absolute ${(ytId && !useYoutube) ? 'top-11' : 'top-2'} left-2 h-8 px-3 rounded-full bg-emerald-500 text-white flex items-center gap-1 active:scale-90 text-[11px] font-bold`}
         >
           <Flame size={11} strokeWidth={3} /> COOK
         </button>
@@ -1345,6 +1537,8 @@ function RecipeModal({ mode, initial, items, onClose, onSave, onDelete, onCook }
   const [prepTime, setPrepTime] = useState(initial.prepTime || "");
   const [cookTime, setCookTime] = useState(initial.cookTime || "");
   const [link, setLink] = useState(initial.link || "");
+  const [youtubeUrl, setYoutubeUrl] = useState(initial.youtubeUrl || "");
+  const [coverSource, setCoverSource] = useState(initial.coverSource || "image");
   const [ingredients, setIngredients] = useState(initial.ingredients?.length ? initial.ingredients : [{ name: "", amount: "", unit: "" }]);
   const [imageUrl, setImageUrl] = useState(initial.imageUrl || "");
   const [busy, setBusy] = useState(false);
@@ -1404,7 +1598,11 @@ function RecipeModal({ mode, initial, items, onClose, onSave, onDelete, onCook }
       id: initial.id, name: name.trim(), mealType,
       prepTime: prepTime ? Number(prepTime) : 0,
       cookTime: cookTime ? Number(cookTime) : 0,
-      link: link.trim(), ingredients: cleaned, imageUrl,
+      link: link.trim(),
+      youtubeUrl: youtubeUrl.trim(),
+      coverSource,
+      ingredients: cleaned,
+      imageUrl,
     });
   };
 
@@ -1472,6 +1670,41 @@ function RecipeModal({ mode, initial, items, onClose, onSave, onDelete, onCook }
             className="w-full bg-white rounded-xl pl-9 pr-4 py-3 text-[14px] outline-none border border-stone-200 focus:border-stone-400 transition" />
         </div>
       </Field>
+
+      <Field label="YouTube video (optional)" className="mt-3">
+        <div className="relative">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2" width="15" height="11" viewBox="0 0 28 20">
+            <path fill="#dc2626" d="M27.4 3.1A3.5 3.5 0 0 0 25 .6C22.8 0 14 0 14 0S5.2 0 3 .6A3.5 3.5 0 0 0 .6 3.1C0 5.3 0 10 0 10s0 4.7.6 6.9a3.5 3.5 0 0 0 2.4 2.5C5.2 20 14 20 14 20s8.8 0 11-.6a3.5 3.5 0 0 0 2.4-2.5c.6-2.2.6-6.9.6-6.9s0-4.7-.6-6.9z"/>
+            <polygon fill="white" points="11.2,14.3 18.5,10 11.2,5.7"/>
+          </svg>
+          <input value={youtubeUrl} onChange={(e) => setYoutubeUrl(e.target.value)}
+            placeholder="https://youtube.com/watch?v=... or youtu.be/..."
+            className="w-full bg-white rounded-xl pl-10 pr-4 py-3 text-[14px] outline-none border border-stone-200 focus:border-stone-400 transition" />
+        </div>
+        {youtubeUrl.trim() && !youtubeId(youtubeUrl) && (
+          <div className="mt-1.5 text-[11px] text-amber-700">Couldn't find a YouTube video ID in that link — double check the URL.</div>
+        )}
+      </Field>
+
+      {/* cover source toggle — only shown when both image and a valid YouTube URL exist */}
+      {imageUrl && youtubeId(youtubeUrl) && (
+        <Field label="Card cover" className="mt-3">
+          <div className="flex gap-1.5">
+            <button type="button" onClick={() => setCoverSource("image")}
+              className={`flex-1 px-3 py-2 rounded-xl text-[13px] font-semibold transition border ${
+                coverSource === "image" ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-700 border-stone-200"
+              }`}>
+              Image
+            </button>
+            <button type="button" onClick={() => setCoverSource("youtube")}
+              className={`flex-1 px-3 py-2 rounded-xl text-[13px] font-semibold transition border ${
+                coverSource === "youtube" ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-700 border-stone-200"
+              }`}>
+              YouTube thumbnail
+            </button>
+          </div>
+        </Field>
+      )}
 
       <div className="mt-4">
         <div className="flex items-center justify-between mb-2">
@@ -1721,258 +1954,21 @@ function ShoppingListModal({ lowStock, missing, onClose }) {
 }
 
 // ============================================================
-// RECEIPT SCAN MODAL — Tesseract.js OCR (free, on-device)
-// ============================================================
-function ReceiptScanModal({ tab, onClose, onConfirm }) {
-  const [stage, setStage] = useState("pick"); // pick | working | review
-  const [progress, setProgress] = useState(0);
-  const [progressLabel, setProgressLabel] = useState("");
-  const [error, setError] = useState("");
-  const [rows, setRows] = useState([]);
-  const [storeName, setStoreName] = useState("");
-  const [defaultLocation, setDefaultLocation] = useState(tab || "fridge");
-  const fileRef = useRef(null);
-
-  // lazy-load tesseract from CDN once on first scan
-  const ensureTesseract = async () => {
-    if (window.Tesseract) return window.Tesseract;
-    setProgressLabel("Loading OCR engine…");
-    await new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "https://unpkg.com/tesseract.js@5.1.0/dist/tesseract.min.js";
-      s.onload = resolve; s.onerror = () => reject(new Error("Couldn't load OCR engine. Check your internet."));
-      document.head.appendChild(s);
-    });
-    return window.Tesseract;
-  };
-
-  const runOCR = async (file) => {
-    setError("");
-    setStage("working");
-    setProgress(0);
-    try {
-      const Tess = await ensureTesseract();
-      setProgressLabel("Reading text…");
-      const { data } = await Tess.recognize(file, "eng", {
-        logger: (m) => {
-          if (m.status === "recognizing text" && typeof m.progress === "number") {
-            setProgress(Math.round(m.progress * 100));
-          }
-        },
-      });
-      const parsed = parseReceiptText(data.text || "");
-      if (parsed.items.length === 0) {
-        setError("Couldn't find any line items. Try a clearer, straighter photo.");
-        setStage("pick");
-        return;
-      }
-      setStoreName(parsed.store || "");
-      setRows(parsed.items.map(p => ({
-        ...p,
-        keep: true,
-        quantity: 1,
-        unit: "ea",
-        location: defaultLocation,
-        foodGroup: "",
-      })));
-      setStage("review");
-    } catch (e) {
-      setError(e.message || "OCR failed.");
-      setStage("pick");
-    }
-  };
-
-  const handleFile = (e) => {
-    const f = e.target.files?.[0]; if (f) runOCR(f);
-  };
-
-  const handlePaste = async () => {
-    try {
-      if (!navigator.clipboard?.read) throw new Error("Paste isn't supported in this browser.");
-      const items = await navigator.clipboard.read();
-      for (const it of items) {
-        for (const t of it.types) {
-          if (t.startsWith("image/")) {
-            const blob = await it.getType(t);
-            return runOCR(blob);
-          }
-        }
-      }
-      throw new Error("No image in clipboard. Copy an image first.");
-    } catch (e) {
-      setError(e.message || "Couldn't paste");
-    }
-  };
-
-  const updateRow = (i, patch) => setRows(rs => rs.map((r, idx) => idx === i ? { ...r, ...patch } : r));
-  const removeRow = (i) => setRows(rs => rs.filter((_, idx) => idx !== i));
-
-  const submit = () => {
-    const kept = rows.filter(r => r.keep && r.name.trim());
-    if (!kept.length) return;
-    onConfirm(kept.map(r => ({
-      name: r.name.trim(),
-      quantity: Number(r.quantity) || 1,
-      unit: r.unit || "ea",
-      location: r.location,
-      foodGroup: r.foodGroup,
-      price: r.price === "" || r.price == null ? null : Number(r.price),
-      store: storeName.trim(),
-      onSale: false,
-      lowStockThreshold: 1,
-      priceHistory: [],
-    })));
-  };
-
-  return (
-    <Sheet onClose={onClose} title={stage === "review" ? "Review items" : "Scan receipt"}>
-      {stage === "pick" && (
-        <>
-          <p className="text-[13px] text-stone-600 mb-4">
-            Snap or upload a clear photo of your receipt. OCR runs on your device — first scan downloads the engine (~4MB).
-          </p>
-          <div className="flex flex-col gap-2">
-            <button onClick={() => fileRef.current?.click()}
-              className="h-12 rounded-xl bg-stone-900 text-white font-semibold flex items-center justify-center gap-2 active:scale-[0.98] transition">
-              <Camera size={16} /> Take or upload photo
-            </button>
-            <button onClick={handlePaste}
-              className="h-12 rounded-xl bg-stone-100 text-stone-800 font-semibold flex items-center justify-center gap-2 active:scale-[0.98] transition">
-              <Clipboard size={16} /> Paste from clipboard
-            </button>
-            <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
-          </div>
-          {error && <div className="mt-3 text-[13px] text-rose-600">{error}</div>}
-          <div className="mt-4 text-[11px] text-stone-500 leading-relaxed">
-            <strong>Tips for better results:</strong> straighten the receipt, good lighting, no shadows over the text, fill the frame.
-            Faded thermal receipts may not parse well — you can still add items manually.
-          </div>
-        </>
-      )}
-
-      {stage === "working" && (
-        <div className="py-12 flex flex-col items-center gap-4">
-          <div className="h-12 w-12 rounded-full border-4 border-stone-200 border-t-stone-900 animate-spin" />
-          <div className="text-[13px] font-semibold text-stone-700">{progressLabel || "Reading…"}</div>
-          {progress > 0 && (
-            <div className="w-48 h-1.5 rounded-full bg-stone-100 overflow-hidden">
-              <div className="h-full bg-stone-900 transition-all" style={{ width: `${progress}%` }} />
-            </div>
-          )}
-          <div className="text-[11px] text-stone-500">First-time scan downloads the OCR engine.</div>
-        </div>
-      )}
-
-      {stage === "review" && (
-        <>
-          <Field label="Store name (applied to all)">
-            <Input value={storeName} onChange={setStoreName} placeholder="Market Basket" />
-          </Field>
-          <Field label="Default location" className="mt-3">
-            <div className="flex gap-1.5">
-              {[["fridge","Fridge"],["pantry","Pantry"],["freezer","Freezer"]].map(([k,l]) => (
-                <button key={k} onClick={() => {
-                  setDefaultLocation(k);
-                  setRows(rs => rs.map(r => ({ ...r, location: k })));
-                }}
-                  className={`flex-1 px-3 py-2 rounded-xl text-[12px] font-semibold transition border ${
-                    defaultLocation === k ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-700 border-stone-200"
-                  }`}>{l}</button>
-              ))}
-            </div>
-          </Field>
-
-          <div className="mt-4 mb-2 flex items-center justify-between">
-            <span className="text-[12px] font-semibold uppercase tracking-wider text-stone-500/80">
-              {rows.filter(r => r.keep).length}/{rows.length} selected
-            </span>
-            <button onClick={() => setRows(rs => rs.map(r => ({ ...r, keep: !rs.every(x => x.keep) })))}
-              className="text-[12px] font-semibold text-stone-700">Toggle all</button>
-          </div>
-
-          <div className="space-y-1.5 max-h-[42vh] overflow-y-auto -mx-1 px-1">
-            {rows.map((r, i) => (
-              <div key={i} className={`flex items-center gap-1.5 p-2 rounded-xl border ${r.keep ? "bg-white border-stone-200" : "bg-stone-50 border-stone-100 opacity-60"}`}>
-                <button onClick={() => updateRow(i, { keep: !r.keep })}
-                  className={`h-5 w-5 rounded-md border-2 shrink-0 flex items-center justify-center ${r.keep ? "bg-stone-900 border-stone-900" : "border-stone-300"}`}>
-                  {r.keep && <Check size={12} strokeWidth={3} className="text-white" />}
-                </button>
-                <input value={r.name} onChange={(e) => updateRow(i, { name: e.target.value })}
-                  placeholder="Item name"
-                  className="flex-1 min-w-0 bg-transparent text-[13px] font-medium outline-none px-1" />
-                <input type="number" inputMode="decimal" step="0.01"
-                  value={r.price ?? ""} onChange={(e) => updateRow(i, { price: e.target.value })}
-                  placeholder="$"
-                  className="w-14 bg-stone-50 rounded-md px-1.5 py-1 text-[12px] outline-none text-right" />
-                <button onClick={() => removeRow(i)}
-                  className="h-7 w-7 text-stone-400 hover:text-rose-500 flex items-center justify-center shrink-0">
-                  <X size={14} />
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="mt-2 text-[11px] text-stone-500">
-            Quantity defaults to 1 each — you can edit each item afterwards to set real quantities, units, food groups, and calories.
-          </div>
-
-          <div className="flex gap-2 mt-5">
-            <button onClick={() => setStage("pick")}
-              className="px-4 py-3 rounded-xl bg-stone-100 text-stone-700 font-semibold active:scale-95 transition">Back</button>
-            <button onClick={submit}
-              disabled={!rows.some(r => r.keep && r.name.trim())}
-              className="flex-1 px-4 py-3 rounded-xl bg-stone-900 text-white font-semibold disabled:opacity-40 active:scale-[0.98] transition">
-              Add {rows.filter(r => r.keep).length} items
-            </button>
-          </div>
-        </>
-      )}
-    </Sheet>
-  );
-}
-
-// Receipt text parser: pulls store name + likely line items
-function parseReceiptText(text) {
-  const lines = text.split(/\r?\n/).map(l => l.replace(/\s+/g, " ").trim()).filter(Boolean);
-  const SKIP_WORDS = /\b(SUBTOTAL|TOTAL|TAX|CASH|CHANGE|CREDIT|DEBIT|VISA|MASTERCARD|AMEX|TENDER|BALANCE|AMOUNT|PAYMENT|CARD|AUTH|REF|ITEM(S)?|QTY|TRANSACTION|RECEIPT|THANK|WELCOME|REWARDS|MEMBER|SAVED|SAVINGS|DISCOUNT|COUPON|TOTAL\s+SAVINGS|GRAND|NET|CHANGE\s+DUE|ROUNDING)\b/i;
-  const items = [];
-  // store guess: first non-empty line that's not a number/address/skip
-  const store = (lines.find(l => /^[A-Za-z][A-Za-z\s&'.]+$/.test(l) && !SKIP_WORDS.test(l) && l.length >= 3 && l.length <= 30) || "").trim();
-
-  // price pattern at end of line: optional $, optional sign, digits, decimal
-  const PRICE_RE = /(?:^|\s)([\$£€]?-?\d{1,4}[.,]\d{2})\s*[A-Z]?\s*$/;
-
-  for (const line of lines) {
-    if (SKIP_WORDS.test(line)) continue;
-    const m = line.match(PRICE_RE);
-    if (!m) continue;
-    let priceStr = m[1].replace(/[\$£€]/g, "").replace(",", ".");
-    const price = Number(priceStr);
-    if (isNaN(price) || price <= 0 || price > 999) continue;
-    let name = line.slice(0, line.length - m[0].length).trim();
-    // strip leading SKU/numeric codes
-    name = name.replace(/^\d{3,}\s+/, "").replace(/^[A-Z0-9]{4,}\s+/, "");
-    // strip trailing weight indicators
-    name = name.replace(/\s+\d+(\.\d+)?\s*(LB|OZ|KG|G|ML|L)\.?$/i, "");
-    name = name.replace(/\s+@\s+\$?\d+(\.\d+)?$/, "");
-    if (name.length < 2) continue;
-    if (/^\d+$/.test(name)) continue;
-    // title-case the result
-    name = name.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
-    items.push({ name, price });
-  }
-
-  // dedupe — if same name appears twice, sum prices? simpler: keep both, user can edit
-  return { store, items };
-}
-
 // ============================================================
 // DATA MODAL — export / import backup
 // ============================================================
 function DataModal({ itemCount, recipeCount, onClose, onImported }) {
+  const [view, setView] = useState("backup"); // backup | ai
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [pendingImport, setPendingImport] = useState(null); // { data, summary }
   const fileRef = useRef(null);
+
+  // AI import state
+  const [aiScope, setAiScope] = useState("ask"); // ask | items | recipes | both
+  const [aiPasteText, setAiPasteText] = useState("");
+  const [aiPasteErr, setAiPasteErr] = useState("");
+  const [aiCopied, setAiCopied] = useState(false);
 
   const handleExport = async () => {
     setBusy(true); setStatus("");
@@ -2017,7 +2013,6 @@ function DataModal({ itemCount, recipeCount, onClose, onImported }) {
       setStatus("Couldn't read file: " + (err.message || "invalid JSON"));
     } finally {
       setBusy(false);
-      // reset input so picking the same file again still triggers onChange
       e.target.value = "";
     }
   };
@@ -2036,13 +2031,109 @@ function DataModal({ itemCount, recipeCount, onClose, onImported }) {
     }
   };
 
+  // ---- AI prompt + paste-back logic ----
+  const aiPromptText = buildAIPrompt(aiScope);
+
+  const copyAIPrompt = async () => {
+    try { await navigator.clipboard.writeText(aiPromptText); setAiCopied(true); setTimeout(() => setAiCopied(false), 1500); } catch {}
+  };
+
+  const handleAIPaste = async () => {
+    setAiPasteErr("");
+    setBusy(true);
+    try {
+      const text = aiPasteText.trim();
+      if (!text) throw new Error("Paste the AI's JSON output first.");
+      const data = parseAIOutput(text);
+      if ((!data.items || data.items.length === 0) && (!data.recipes || data.recipes.length === 0)) {
+        throw new Error("No items or recipes found in the JSON.");
+      }
+      setPendingImport({
+        data: {
+          items: data.items || [],
+          recipes: data.recipes || [],
+        },
+        summary: `${(data.items || []).length} items, ${(data.recipes || []).length} recipes (from AI)`,
+        merge: true,  // AI imports are additive — don't blast existing data
+      });
+    } catch (e) {
+      setAiPasteErr(e.message || "Couldn't parse JSON");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmAIImport = async () => {
+    if (!pendingImport) return;
+    setBusy(true); setStatus("");
+    try {
+      if (pendingImport.merge) {
+        // additive merge: append AI-generated items + recipes to existing
+        await mergeAddItemsAndRecipes(pendingImport.data);
+      } else {
+        await importAllData(pendingImport.data);
+      }
+      setPendingImport(null);
+      setAiPasteText("");
+      onImported();
+    } catch (e) {
+      setStatus("Import failed: " + (e.message || "unknown error"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <Sheet onClose={onClose} title="Backup & restore">
-      <div className="text-[13px] text-stone-600 mb-4">
+    <Sheet onClose={onClose} title="Backup & import">
+      <div className="text-[13px] text-stone-600 mb-3">
         You currently have <strong>{itemCount} items</strong> and <strong>{recipeCount} recipes</strong>.
       </div>
 
-      {!pendingImport ? (
+      {!pendingImport && (
+        <div className="flex gap-1 mb-4 p-1 rounded-full bg-stone-100">
+          {[["backup","Backup / restore"],["ai","AI import"]].map(([k,l]) => (
+            <button key={k} onClick={() => setView(k)}
+              className={`flex-1 py-1.5 rounded-full text-[12px] font-semibold transition ${
+                view === k ? "bg-white text-stone-900 shadow-sm" : "text-stone-500"
+              }`}>
+              {l}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {pendingImport ? (
+        <>
+          <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 mb-4">
+            <div className="flex items-start gap-2">
+              <AlertTriangle size={16} className="text-amber-600 mt-0.5 shrink-0" />
+              <div className="text-[13px] text-amber-900">
+                {pendingImport.merge ? (
+                  <><strong>Adds to your current data.</strong> AI-generated items and recipes will be appended without removing anything you already have.</>
+                ) : (
+                  <><strong>This will replace everything.</strong> Your current {itemCount} items and {recipeCount} recipes will be gone.</>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="text-[13px] text-stone-700 mb-4">
+            Importing: <strong>{pendingImport.summary}</strong>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => setPendingImport(null)} disabled={busy}
+              className="px-4 py-3 rounded-xl bg-stone-100 text-stone-700 font-semibold active:scale-95 transition">
+              Cancel
+            </button>
+            <button onClick={pendingImport.merge ? confirmAIImport : confirmImport} disabled={busy}
+              className={`flex-1 px-4 py-3 rounded-xl text-white font-semibold active:scale-[0.98] transition disabled:opacity-50 ${
+                pendingImport.merge ? "bg-emerald-600" : "bg-rose-500"
+              }`}>
+              {pendingImport.merge ? "Add to my pantry" : "Replace & import"}
+            </button>
+          </div>
+          {status && <div className="mt-4 text-[12px] text-rose-700 bg-rose-50 rounded-lg p-3">{status}</div>}
+        </>
+      ) : view === "backup" ? (
         <>
           <button onClick={handleExport} disabled={busy}
             className="w-full h-12 rounded-xl bg-stone-900 text-white font-semibold flex items-center justify-center gap-2 active:scale-[0.98] transition disabled:opacity-50">
@@ -2066,29 +2157,52 @@ function DataModal({ itemCount, recipeCount, onClose, onImported }) {
           {status && <div className="mt-4 text-[12px] text-stone-700 bg-stone-50 rounded-lg p-3">{status}</div>}
         </>
       ) : (
+        // ----- AI IMPORT VIEW -----
         <>
-          <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 mb-4">
-            <div className="flex items-start gap-2">
-              <AlertTriangle size={16} className="text-amber-600 mt-0.5 shrink-0" />
-              <div className="text-[13px] text-amber-900">
-                <strong>This will replace everything.</strong> Your current {itemCount} items and {recipeCount} recipes will be gone.
-              </div>
+          <p className="text-[13px] text-stone-600 mb-3">
+            Copy the prompt below into ChatGPT, Claude, or any AI. It tells the AI exactly how to format the output. Then paste the JSON it returns.
+          </p>
+
+          <Field label="What should the AI produce?">
+            <div className="flex gap-1 flex-wrap">
+              {[["ask","Let AI ask me"],["items","Items"],["recipes","Recipes"],["both","Both"]].map(([k,l]) => (
+                <button key={k} type="button" onClick={() => setAiScope(k)}
+                  className={`px-3 h-8 rounded-full text-[12px] font-semibold transition border ${
+                    aiScope === k ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-700 border-stone-200"
+                  }`}>
+                  {l}
+                </button>
+              ))}
             </div>
-          </div>
-          <div className="text-[13px] text-stone-700 mb-4">
-            Importing: <strong>{pendingImport.summary}</strong>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => setPendingImport(null)} disabled={busy}
-              className="px-4 py-3 rounded-xl bg-stone-100 text-stone-700 font-semibold active:scale-95 transition">
-              Cancel
-            </button>
-            <button onClick={confirmImport} disabled={busy}
-              className="flex-1 px-4 py-3 rounded-xl bg-rose-500 text-white font-semibold active:scale-[0.98] transition disabled:opacity-50">
-              Replace & import
-            </button>
-          </div>
-          {status && <div className="mt-4 text-[12px] text-rose-700 bg-rose-50 rounded-lg p-3">{status}</div>}
+          </Field>
+
+          <Field label="1. Copy this prompt" className="mt-3">
+            <div className="relative">
+              <textarea readOnly value={aiPromptText} rows={6}
+                className="w-full bg-stone-50 rounded-xl px-3 py-3 text-[12px] outline-none border border-stone-200 resize-none font-mono leading-relaxed" />
+              <button onClick={copyAIPrompt}
+                className="absolute top-2 right-2 h-7 px-2.5 rounded-full bg-stone-900 text-white text-[11px] font-semibold flex items-center gap-1 active:scale-95">
+                {aiCopied ? <><Check size={11} strokeWidth={3} /> Copied</> : <><Copy size={11} strokeWidth={2.5} /> Copy</>}
+              </button>
+            </div>
+          </Field>
+
+          <Field label="2. Paste the AI's JSON output here" className="mt-3">
+            <textarea value={aiPasteText} onChange={(e) => setAiPasteText(e.target.value)} rows={5}
+              placeholder='{"items": [...], "recipes": [...]}'
+              className="w-full bg-white rounded-xl px-3 py-3 text-[12px] outline-none border border-stone-200 focus:border-stone-400 transition resize-none font-mono" />
+          </Field>
+
+          <button onClick={handleAIPaste} disabled={busy || !aiPasteText.trim()}
+            className="w-full mt-3 h-11 rounded-xl bg-stone-900 text-white font-semibold flex items-center justify-center gap-2 active:scale-[0.98] transition disabled:opacity-40">
+            <Upload size={15} /> Preview &amp; import
+          </button>
+
+          {aiPasteErr && <div className="mt-3 text-[12px] text-rose-700 bg-rose-50 rounded-lg p-3">{aiPasteErr}</div>}
+
+          <p className="text-[11px] text-stone-500 mt-3 px-1">
+            AI imports add to your current data — they don't overwrite. You'll see a preview step before anything gets saved.
+          </p>
         </>
       )}
     </Sheet>
@@ -2223,8 +2337,8 @@ function Sheet({ title, onClose, children }) {
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" role="dialog">
       <div onClick={onClose} className="absolute inset-0 bg-stone-900/50 backdrop-blur-sm" />
-      <div className="relative w-full max-w-[440px] bg-white rounded-t-3xl sm:rounded-3xl slide-up max-h-[92vh] overflow-y-auto">
-        <div className="sticky top-0 bg-white/95 backdrop-blur z-10 flex items-center justify-between px-5 pt-4 pb-3 border-b border-stone-100">
+      <div className="relative w-full max-w-[440px] sheet-bg bg-white rounded-t-3xl sm:rounded-3xl slide-up max-h-[92vh] overflow-y-auto">
+        <div className="sticky top-0 sheet-header bg-white/95 backdrop-blur z-10 flex items-center justify-between px-5 pt-4 pb-3 border-b border-stone-100">
           <h3 className="text-[17px] font-bold tracking-tight">{title}</h3>
           <button onClick={onClose} className="h-8 w-8 rounded-full bg-stone-100 flex items-center justify-center active:scale-90">
             <X size={16} />
